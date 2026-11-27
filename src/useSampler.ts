@@ -10,8 +10,9 @@ import * as Haptics from 'expo-haptics';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 
-import { MAX_CLIP_MS, MIN_CLIP_MS } from './pads';
+import { LEVEL_INTERVAL_MS, MAX_CLIP_MS, MIN_CLIP_MS, WAVEFORM_BARS } from './pads';
 import { Clips, discardRecording, loadClips, saveClip } from './storage';
+import { resample } from './Waveform';
 
 export type MicAccess = 'unknown' | 'granted' | 'blocked';
 
@@ -37,7 +38,7 @@ const RECORDING_MODE = { allowsRecording: true, playsInSilentMode: true } as con
 
 export function useSampler() {
   const recorder = useAudioRecorder(RECORDING_OPTIONS);
-  const recorderState = useAudioRecorderState(recorder, 80);
+  const recorderState = useAudioRecorderState(recorder, LEVEL_INTERVAL_MS);
 
   const [clips, setClips] = useState<Clips>(() => {
     try {
@@ -48,8 +49,24 @@ export function useSampler() {
   });
   const [recordingPadId, setRecordingPadId] = useState<string | null>(null);
   const [micAccess, setMicAccess] = useState<MicAccess>('unknown');
-  const [message, setMessage] = useState('hold a pad to record. tap to play.');
+  const [message, setMessage] = useState('Hold a pad to record. Tap to play.');
   const hold = useRef<Hold | null>(null);
+  // microphone levels of the current take, one per poll, each 0..1
+  const samples = useRef<number[]>([]);
+  const [liveLevels, setLiveLevels] = useState<number[]>([]);
+
+  // metering is in decibels: about -50 in a quiet room, 0 at the loudest. map it to 0..1.
+  useEffect(() => {
+    const current = hold.current;
+    // after the stop the recorder reports a full level. that is not part of the sound.
+    if (!current?.startedAt || current.finishing || !recorderState.isRecording) return;
+    if (typeof recorderState.metering !== 'number') return;
+    samples.current.push(Math.min(1, Math.max(0, (recorderState.metering + 50) / 50)));
+    // the waveform fills from the left as the time limit is used
+    const expected = MAX_CLIP_MS / LEVEL_INTERVAL_MS;
+    const bars = Math.min(WAVEFORM_BARS, Math.ceil((samples.current.length / expected) * WAVEFORM_BARS));
+    setLiveLevels(resample(samples.current, bars));
+  }, [recorderState]);
 
   const checkMicAccess = useCallback(() => {
     getRecordingPermissionsAsync()
@@ -84,16 +101,20 @@ export function useSampler() {
       const uri = recorder.uri;
       if (!uri || heldMs < MIN_CLIP_MS) {
         discardRecording(uri);
-        setMessage('too short. hold the pad while the sound happens.');
+        setMessage('Too short. Hold the pad while the sound happens.');
       } else {
-        const savedUri = await saveClip(current.padId, uri);
-        setClips((previous) => ({ ...previous, [current.padId]: savedUri }));
+        // scale the shape to its loudest point, so a quiet sound still shows a shape.
+        // the floor keeps room noise from filling the pad.
+        const peak = Math.max(0.35, ...samples.current);
+        const levels = resample(samples.current, WAVEFORM_BARS).map((level) => level / peak);
+        const clip = await saveClip(current.padId, uri, levels);
+        setClips((previous) => ({ ...previous, [current.padId]: clip }));
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-        setMessage('saved. tap the pad to play it.');
+        setMessage('Saved. Tap the pad to play it.');
       }
     } catch (error) {
       console.warn('could not save the recording', error);
-      setMessage('that take did not save. try again.');
+      setMessage('That take did not save. Try again.');
     } finally {
       hold.current = null;
       setRecordingPadId(null);
@@ -116,7 +137,7 @@ export function useSampler() {
           hold.current = null;
           setMicAccess(permission.granted ? 'granted' : 'blocked');
           setMessage(
-            permission.granted ? 'microphone is on. hold a pad to record.' : 'recording needs the microphone.'
+            permission.granted ? 'The microphone is on. Hold a pad to record.' : 'Recording needs the microphone.'
           );
           return;
         }
@@ -129,22 +150,24 @@ export function useSampler() {
           discardRecording(recorder.uri);
           await setAudioModeAsync(PLAYBACK_MODE);
           hold.current = null;
-          setMessage('keep holding the pad to record.');
+          setMessage('Keep holding the pad to record.');
           return;
         }
 
+        samples.current = [];
+        setLiveLevels([]);
         recorder.record();
         current.startedAt = Date.now();
         current.timer = setTimeout(endHold, MAX_CLIP_MS);
         setRecordingPadId(padId);
-        setMessage('recording. release to save.');
+        setMessage('Recording. Release to save.');
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {});
       } catch (error) {
         console.warn('could not start the recording', error);
         hold.current = null;
         setRecordingPadId(null);
         setAudioModeAsync(PLAYBACK_MODE).catch(() => {});
-        setMessage('the microphone did not start. try again.');
+        setMessage('The microphone did not start. Try again.');
       }
     },
     [recorder, endHold]
@@ -160,11 +183,7 @@ export function useSampler() {
     return () => subscription.remove();
   }, [endHold, checkMicAccess]);
 
-  // metering is in decibels, about -60 (quiet room) to 0 (loud). map it to 0..1.
-  const level =
-    recordingPadId && typeof recorderState.metering === 'number'
-      ? Math.min(1, Math.max(0, (recorderState.metering + 60) / 60))
-      : 0;
+  const recordedMs = recordingPadId ? recorderState.durationMillis : 0;
 
-  return { clips, recordingPadId, level, micAccess, message, setMessage, beginHold, endHold };
+  return { clips, recordingPadId, liveLevels, recordedMs, micAccess, message, setMessage, beginHold, endHold };
 }

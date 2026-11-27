@@ -1,54 +1,37 @@
 import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
+import { GlassView, isLiquidGlassAvailable } from 'expo-glass-effect';
 import * as Haptics from 'expo-haptics';
-import { useEffect, useRef } from 'react';
-import { Animated, Easing, Pressable, StyleSheet, Text, View } from 'react-native';
+import { SymbolView, type SFSymbol } from 'expo-symbols';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { MAX_CLIP_MS, PadConfig } from './pads';
+import type { Clip } from './storage';
+import { inkOn, radius, type, useTheme } from './theme';
+import { Waveform } from './Waveform';
 
 type Props = {
   pad: PadConfig;
-  clipUri?: string;
+  clip?: Clip;
   isRecording: boolean;
-  level: number; // 0..1 microphone level, only while this pad records
+  liveLevels: number[]; // the waveform of the take in progress, only while this pad records
+  recordedMs: number;
   locked: boolean; // a different pad records now
   onHoldStart: () => void;
   onHoldEnd: () => void;
   onEmptyTap: () => void;
 };
 
-const RECORDING_COLOR = '#FF3B30';
+// liquid glass needs ios 26. older systems get a plain surface.
+const glass = isLiquidGlassAvailable();
 
-export function Pad({ pad, clipUri, isRecording, level, locked, onHoldStart, onHoldEnd, onEmptyTap }: Props) {
-  const player = useAudioPlayer(clipUri ?? null, { updateInterval: 100 });
+const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+export function Pad({ pad, clip, isRecording, liveLevels, recordedMs, locked, onHoldStart, onHoldEnd, onEmptyTap }: Props) {
+  const { scheme, colors } = useTheme();
+  const player = useAudioPlayer(clip?.uri ?? null, { updateInterval: 50 });
   const status = useAudioPlayerStatus(player);
-  const hasClip = Boolean(clipUri);
-
-  const press = useRef(new Animated.Value(0)).current;
-  const elapsed = useRef(new Animated.Value(0)).current;
-  const meter = useRef(new Animated.Value(0)).current;
-
-  // the bar at the bottom shows how much of the time limit is used
-  useEffect(() => {
-    if (!isRecording) {
-      elapsed.setValue(0);
-      return;
-    }
-    const animation = Animated.timing(elapsed, {
-      toValue: 1,
-      duration: MAX_CLIP_MS,
-      easing: Easing.linear,
-      useNativeDriver: true,
-    });
-    animation.start();
-    return () => animation.stop();
-  }, [isRecording, elapsed]);
-
-  useEffect(() => {
-    Animated.timing(meter, { toValue: level, duration: 80, useNativeDriver: true }).start();
-  }, [level, meter]);
-
-  const pressTo = (value: number) =>
-    Animated.spring(press, { toValue: value, useNativeDriver: true, speed: 40, bounciness: 6 }).start();
+  const hasClip = Boolean(clip);
+  const isPlaying = hasClip && status.playing;
 
   const play = async () => {
     if (!hasClip) {
@@ -62,62 +45,75 @@ export function Pad({ pad, clipUri, isRecording, level, locked, onHoldStart, onH
     player.play();
   };
 
-  const seconds = status.duration > 0 ? `${status.duration.toFixed(1)}s` : '';
-  const caption = isRecording ? 'release to save' : hasClip ? seconds : 'hold to record';
-  const surfaceColor = isRecording ? RECORDING_COLOR : hasClip ? pad.color : 'transparent';
-  const inkColor = isRecording ? '#FFFFFF' : hasClip ? '#14110F' : pad.color;
+  // three looks: recording (red), filled (the pad color), empty (clear glass)
+  const padColor = colors.pad[pad.color];
+  const tint = isRecording ? colors.red : hasClip ? padColor : undefined;
+  const ink = isRecording ? '#FFFFFF' : hasClip ? inkOn(pad.color) : colors.label;
+  const accent = isRecording || hasClip ? ink : padColor;
+
+  const symbol: SFSymbol = isRecording
+    ? 'record.circle.fill'
+    : isPlaying
+      ? 'speaker.wave.2.fill'
+      : hasClip
+        ? 'play.fill'
+        : 'mic.fill';
+  const time = isRecording
+    ? `${seconds(Math.min(recordedMs, MAX_CLIP_MS))} / ${seconds(MAX_CLIP_MS)}`
+    : hasClip && status.duration > 0
+      ? seconds(status.duration * 1000)
+      : '';
+  const caption = isRecording ? 'Release to save' : hasClip ? 'Tap to play' : 'Hold to record';
 
   return (
     <Pressable
-      style={styles.cell}
+      style={[styles.cell, locked && styles.locked]}
       disabled={locked}
       delayLongPress={220}
       pressRetentionOffset={80}
-      onPressIn={() => pressTo(1)}
       onPress={play}
       onLongPress={onHoldStart}
-      onPressOut={() => {
-        pressTo(0);
-        onHoldEnd();
-      }}
+      onPressOut={onHoldEnd}
       accessibilityRole="button"
-      accessibilityLabel={`${pad.name} pad, ${hasClip ? 'has a sound' : 'empty'}`}
-      accessibilityHint={hasClip ? 'tap to play, hold to record again' : 'hold to record a sound'}>
-      <Animated.View
-        style={[
-          styles.surface,
-          {
-            backgroundColor: surfaceColor,
-            borderColor: isRecording ? RECORDING_COLOR : pad.color,
-            opacity: locked ? 0.35 : 1,
-            transform: [{ scale: press.interpolate({ inputRange: [0, 1], outputRange: [1, 0.94] }) }],
-          },
-        ]}>
-        {status.playing && <View style={styles.playingGlow} />}
-
-        {isRecording && (
-          <Animated.View
-            style={[
-              styles.meter,
-              {
-                opacity: meter.interpolate({ inputRange: [0, 1], outputRange: [0.15, 0.5] }),
-                transform: [{ scale: meter.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1.9] }) }],
-              },
-            ]}
+      accessibilityLabel={`${pad.name}, ${isRecording ? 'recording' : hasClip ? `sound, ${time}` : 'empty'}`}
+      accessibilityHint={hasClip ? 'Tap to play. Hold to record again.' : 'Hold to record a sound.'}>
+      <GlassView
+        isInteractive
+        colorScheme={scheme}
+        tintColor={tint}
+        style={[styles.surface, !glass && { backgroundColor: tint ?? colors.fill }]}>
+        <View style={styles.top}>
+          <SymbolView
+            name={symbol}
+            size={22}
+            weight="semibold"
+            tintColor={accent}
+            animationSpec={isRecording ? { effect: { type: 'pulse' }, repeating: true } : undefined}
           />
-        )}
+          <Text style={[styles.time, { color: ink }]} maxFontSizeMultiplier={1.3}>
+            {time}
+          </Text>
+        </View>
 
-        <Text style={[styles.name, { color: inkColor }]} numberOfLines={1} adjustsFontSizeToFit>
-          {pad.name}
-        </Text>
-        <Text style={[styles.caption, { color: inkColor }]}>{caption}</Text>
+        <Waveform
+          levels={isRecording ? liveLevels : (clip?.levels ?? [])}
+          color={accent}
+          progress={isPlaying && status.duration > 0 ? status.currentTime / status.duration : undefined}
+        />
 
-        {isRecording && (
-          <View style={styles.track}>
-            <Animated.View style={[styles.trackFill, { transform: [{ scaleX: elapsed }] }]} />
-          </View>
-        )}
-      </Animated.View>
+        <View>
+          <Text
+            style={[type.title2, { color: ink }]}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            maxFontSizeMultiplier={1.3}>
+            {pad.name}
+          </Text>
+          <Text style={[type.footnote, styles.caption, { color: ink }]} numberOfLines={1} maxFontSizeMultiplier={1.3}>
+            {caption}
+          </Text>
+        </View>
+      </GlassView>
     </Pressable>
   );
 }
@@ -126,55 +122,30 @@ const styles = StyleSheet.create({
   cell: {
     flex: 1,
   },
+  locked: {
+    opacity: 0.4,
+  },
   surface: {
     flex: 1,
-    borderRadius: 28,
+    borderRadius: radius.pad,
     borderCurve: 'continuous',
-    borderWidth: 2.5,
     padding: 18,
-    justifyContent: 'flex-end',
+    justifyContent: 'space-between',
     overflow: 'hidden',
   },
-  playingGlow: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-    backgroundColor: 'rgba(255,255,255,0.38)',
+  top: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    minHeight: 26,
   },
-  meter: {
-    position: 'absolute',
-    alignSelf: 'center',
-    top: '18%',
-    width: 96,
-    height: 96,
-    borderRadius: 48,
-    backgroundColor: '#FFFFFF',
-  },
-  name: {
-    fontSize: 30,
-    fontWeight: '800',
-    letterSpacing: -0.8,
+  time: {
+    ...type.footnote,
+    fontVariant: ['tabular-nums'],
+    opacity: 0.8,
   },
   caption: {
     marginTop: 2,
-    fontSize: 14,
-    fontWeight: '600',
-    opacity: 0.75,
-    fontVariant: ['tabular-nums'],
-  },
-  track: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: 6,
-    backgroundColor: 'rgba(255,255,255,0.3)',
-  },
-  trackFill: {
-    flex: 1,
-    backgroundColor: '#FFFFFF',
-    transformOrigin: 'left',
+    opacity: 0.65,
   },
 });
